@@ -18,7 +18,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
+from transformer_engine.common.recipe import Format, DelayedScaling
 from transformer_engine.pytorch.distributed import prepare_te_modules_for_fsdp
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
@@ -66,19 +66,6 @@ def torch_dtype(d):
     if lowercase(d) not in typemap.keys():
         raise TypeError
     return typemap[lowercase(d)]
-
-
-def precision(d):
-    typemap = [
-        "fp32",
-        "fp16",
-        "fp8",
-        "mxfp8",
-        "nvfp4"
-    ]
-    if lowercase(d) not in typemap:
-        raise TypeError
-    return lowercase(d)
 
 
 te_layer_map = {
@@ -186,11 +173,7 @@ def parse_fsdp_args():
         "--no-fp8",
         action="store_true",
         default=False,
-        help="Disables the te.autocast() context. When set, FP8 training is disabled "
-        + "and the model trains in standard precision (as specified by --dtype). "
-        + "Takes precedence over --precision if both are specified. "
-        + "Example: '--no-fp8 --precision fp8' will disable FP8 despite fp8 preset. "
-        + "Default: False (FP8 enabled based on precision).",
+        help="Disables the te.autocast() context.",
     )
     parser.add_argument(
         "--no-defer-init",
@@ -206,23 +189,7 @@ def parse_fsdp_args():
         "--dtype",
         type=torch_dtype,
         default=torch.bfloat16,
-        help="Data type for input tensor and Transformer Engine module parameters. "
-        + "Supported values: fp32/float32, fp16/float16, bf16/bfloat16. "
-        + "Takes precedence over --precision if both are specified. "
-        + "Example: '--dtype fp16 --precision fp8' will use fp16 dtype and ignore fp8 preset. "
-        + "Default: bfloat16.",
-    )
-    parser.add_argument(
-        "--precision",
-        type=precision,
-        default="fp8",
-        help="Precision preset for model training. Supported values: FP32, FP16, FP8, MXFP8, NVFP4. "
-        + "This is a convenience flag that configures both dtype and FP8 settings automatically. "
-        + "If --dtype or --no-fp8 are explicitly specified, they take precedence over this flag "
-        + "and a warning will be issued. "
-        + "Precedence: --dtype and --no-fp8 override --precision. "
-        + "Example: Use '--precision fp8' for quick setup, or '--dtype bf16 --no-fp8' for explicit control. "
-        + "Default: fp8.",
+        help="Data type for input tensor and Transformer Engine module parameters.",
     )
     return parser.parse_args()
 
@@ -234,13 +201,6 @@ def dist_print(text, all_ranks=False, no_new_line=False):
 
 
 def train(opts):
-    import sys
-
-    # Check which flags were explicitly set
-    dtype_explicitly_set = '--dtype' in sys.argv
-    no_fp8_explicitly_set = '--no-fp8' in sys.argv
-    precision_is_non_default = opts.precision != "fp8"
-
     # Initialize torch.distributed global process group
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(LOCAL_RANK)
@@ -249,73 +209,6 @@ def train(opts):
 
     # Construct a simple homogeneous model (only one layer type) with NO PARALLELISM
     layer_args, layer_kwargs = get_layer_args(opts)
-
-    if not dtype_explicitly_set and not no_fp8_explicitly_set:
-
-        dist_print(f"Using precision preset: {opts.precision}")
-
-        match opts.precision:
-            case "fp32":
-                dtype=torch.float32
-
-                #set up, but not used by autocast with no-fp8 set to true
-                precision_format = Format.HYBRID
-                recipe = DelayedScaling(fp8_format=precision_format, amax_history_len=32, amax_compute_algo="max")
-
-                no_fp8 = True
-            case "fp16":
-                dtype=torch.float16
-
-                #set up, but not used by autocast with no-fp8 set to true
-                precision_format = Format.HYBRID
-                recipe = DelayedScaling(fp8_format=precision_format, amax_history_len=32, amax_compute_algo="max")
-
-                no_fp8 = True
-            case "fp8":
-                dtype=torch.float16
-                precision_format = Format.HYBRID
-                recipe = DelayedScaling(fp8_format=precision_format, amax_history_len=32, amax_compute_algo="max")
-                no_fp8 = False
-            case "mxfp8":
-                dtype=torch.float16
-                precision_format = Format.E4M3
-                recipe = MXFP8BlockScaling(fp8_format=precision_format)
-                no_fp8 = False
-            case "nvfp4":
-                dtype=torch.bfloat16 # RHT only supports bfloat16
-                recipe = NVFP4BlockScaling()
-                no_fp8 = False
-            case _:
-                dtype=torch.float16
-                precision_format = Format.HYBRID
-                recipe = DelayedScaling(fp8_format=precision_format, amax_history_len=32, amax_compute_algo="max")
-                no_fp8 = opts.no_fp8
-    else:
-        # dtype and/or no_fp8 were explicitly set - they take precedence
-        dtype = opts.dtype
-        no_fp8 = opts.no_fp8
-
-        # Set up default recipe for FP8 cases
-        if not no_fp8:
-            precision_format = Format.HYBRID
-            recipe = DelayedScaling(fp8_format=precision_format, amax_history_len=32, amax_compute_algo="max")
-        else:
-            recipe = None
-
-         # Warn if precision was also set to non-default (being overridden)
-        if precision_is_non_default:
-            if dtype_explicitly_set:
-                dist_print(f"Warning: --dtype {dtype} overrides --precision {opts.precision}")
-            if no_fp8_explicitly_set:
-                dist_print(f"Warning: --no-fp8 overrides --precision {opts.precision}")
-
-    # Always log the final configuration being used
-    dist_print(f"Training configuration: dtype={dtype}, FP8={'disabled' if no_fp8 else 'enabled'}")
-    if not no_fp8:
-        dist_print(f"Using FP8 recipe: {type(recipe).__name__}")
-        
-    layer_kwargs["params_dtype"]=dtype
-
     if opts.num_layers > 1:
         te_layer_list = []
         for i in range(opts.num_layers):
@@ -365,6 +258,10 @@ def train(opts):
     dist_print(f"Post-FSDP memory use = {post_mem_use}MiB")
     dist_print(f"FSDP-Wrapped + Checkpointed TE Model:\n{te_model}")
 
+    # Fp8 setup for TE
+    fp8_format = Format.HYBRID
+    fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=32, amax_compute_algo="max")
+
     # Optimizer must be created after the model is wrapped in FSDP and the parameters are sharded
     optim = torch.optim.Adam(te_model.parameters(), lr=0.0001)
 
@@ -384,11 +281,11 @@ def train(opts):
             opts.seq_length,
             opts.batch_size,
             opts.num_heads * opts.head_dim,
-            dtype=dtype,
+            dtype=opts.dtype,
             device="cuda",
         )
         # autocast needs to be given the FSDP process group for amax reductions
-        with te.autocast(enabled=not no_fp8, recipe=recipe, amax_reduction_group=all_gpus):
+        with te.autocast(enabled=not opts.no_fp8, recipe=fp8_recipe, amax_reduction_group=all_gpus):
             y = te_model(x)
             loss = y.sum()
         # calculate gradient and take training step outside the autocast context
